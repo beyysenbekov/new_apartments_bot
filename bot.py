@@ -14,7 +14,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_СВОЙ_ТОКЕН_ЗДЕСЬ")
+BOT_TOKEN = "8737332675:AAEELNxtay1ha0ExxrwfoeQE9L_aKAl1InA"
 DATA_FILE  = Path("user_data.json")
 CHECK_INTERVAL_MINUTES = 15
 
