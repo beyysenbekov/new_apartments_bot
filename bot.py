@@ -1,37 +1,21 @@
 #!/usr/bin/env python3
-"""
-Krisha.kz Monitor Bot — исправленная версия
-"""
+"""Krisha.kz Monitor Bot — исправленные дубли"""
 
-import os
-import json
-import logging
-import asyncio
+import os, json, logging, asyncio, re
 from pathlib import Path
-
 import requests
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    CallbackQueryHandler,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
-# ─────────────────────────────────────────────
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
+    format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO,
+    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "8737332675:AAEELNxtay1ha0ExxrwfoeQE9L_aKAl1InA"
-DATA_FILE = Path("user_data.json")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_СВОЙ_ТОКЕН_ЗДЕСЬ")
+DATA_FILE  = Path("user_data.json")
 CHECK_INTERVAL_MINUTES = 15
 
 HEADERS = {
@@ -41,9 +25,11 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ru-RU,ru;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://krisha.kz/",
 }
 
-# ── Данные ────────────────────────────────────
+# ── Хранилище ─────────────────────────────────────────────────────────────────
 
 def load_data() -> dict:
     if DATA_FILE.exists():
@@ -69,7 +55,18 @@ def save_user(chat_id: int, user: dict):
     data[str(chat_id)] = user
     save_data(data)
 
-# ── Парсер ────────────────────────────────────
+# ── Парсер ────────────────────────────────────────────────────────────────────
+
+def extract_id(href: str) -> str:
+    """
+    Извлекаем числовой ID из любого формата ссылки krisha.kz.
+    Примеры:
+      /a/show/123456789          → 123456789
+      /prodazha/kvartiry/almaty/123456789.html → 123456789
+    Если числа нет — возвращаем сам href как уникальный ключ.
+    """
+    numbers = re.findall(r'\d{6,}', href)
+    return numbers[0] if numbers else href
 
 def build_url(max_price: int, rooms: list) -> str:
     base = "https://krisha.kz/prodazha/kvartiry/almaty/"
@@ -89,31 +86,84 @@ def parse_listings(max_price: int, rooms: list) -> list:
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    cards = soup.select("div.a-card")
-    logger.info(f"Найдено карточек: {len(cards)}")
-    listings = []
 
+    # Пробуем несколько возможных селекторов карточек
+    cards = (
+        soup.select("div.a-card") or
+        soup.select("article.a-card") or
+        soup.select("[data-id]") or
+        soup.select(".offer-short") or
+        soup.select(".list-item")
+    )
+    logger.info(f"Найдено карточек: {len(cards)}")
+
+    listings = []
     for card in cards:
         try:
-            link_tag = card.select_one("a[href*='/a/show/']")
-            if not link_tag:
+            # ── ID ──────────────────────────────────────────────────────────
+            # Вариант 1: атрибут data-id прямо на карточке
+            ad_id = card.get("data-id") or card.get("id") or ""
+
+            # Вариант 2: из ссылки внутри карточки
+            if not ad_id:
+                link_tag = (
+                    card.select_one("a[href*='/a/show/']") or
+                    card.select_one("a[href*='/prodazha/']") or
+                    card.select_one("a[href]")
+                )
+                if not link_tag:
+                    continue
+                href = link_tag.get("href", "")
+                ad_id = extract_id(href)
+                full_url = f"https://krisha.kz{href}" if href.startswith("/") else href
+            else:
+                ad_id = str(ad_id)
+                full_url = f"https://krisha.kz/a/show/{ad_id}/"
+
+            if not ad_id:
                 continue
-            href = link_tag.get("href", "")
-            ad_id = href.split("/a/show/")[-1].split("/")[0].split("?")[0]
-            full_url = f"https://krisha.kz{href}" if href.startswith("/") else href
 
-            title = (card.select_one(".a-card__title") or {}).get_text(strip=True) if card.select_one(".a-card__title") else "Квартира"
-            price_text = card.select_one(".a-card__price").get_text(strip=True) if card.select_one(".a-card__price") else "—"
-            address = card.select_one(".a-card__subtitle").get_text(strip=True) if card.select_one(".a-card__subtitle") else "Алматы"
-            desc = card.select_one(".a-card__header-left").get_text(" ", strip=True) if card.select_one(".a-card__header-left") else ""
+            # ── Текстовые поля ───────────────────────────────────────────────
+            title_tag = (card.select_one(".a-card__title") or
+                         card.select_one(".offer-title") or
+                         card.select_one("h3") or
+                         card.select_one("h2"))
+            title = title_tag.get_text(strip=True) if title_tag else "Квартира"
 
-            img_tag = card.select_one("img.a-card__img, .a-card__image img")
+            price_tag = (card.select_one(".a-card__price") or
+                         card.select_one(".price") or
+                         card.select_one("[class*='price']"))
+            price_text = price_tag.get_text(strip=True) if price_tag else "—"
+
+            addr_tag = (card.select_one(".a-card__subtitle") or
+                        card.select_one(".address") or
+                        card.select_one("[class*='address']"))
+            address = addr_tag.get_text(strip=True) if addr_tag else "Алматы"
+
+            desc_tag = card.select_one(".a-card__header-left")
+            desc = desc_tag.get_text(" ", strip=True) if desc_tag else ""
+
+            img_tag = card.select_one("img.a-card__img, .a-card__image img, img[src]")
             photo = (img_tag.get("src") or img_tag.get("data-src")) if img_tag else None
+            # Пропускаем placeholder-картинки
+            if photo and ("placeholder" in photo or "no-photo" in photo or photo.endswith(".svg")):
+                photo = None
 
-            listings.append({"id": ad_id, "title": title, "price": price_text,
-                              "desc": desc, "address": address, "url": full_url, "photo": photo})
+            listings.append({
+                "id":      ad_id,
+                "title":   title,
+                "price":   price_text,
+                "desc":    desc,
+                "address": address,
+                "url":     full_url,
+                "photo":   photo,
+            })
+
+            logger.debug(f"  Объявление id={ad_id} цена={price_text}")
+
         except Exception as e:
             logger.warning(f"Ошибка карточки: {e}")
+
     return listings
 
 def fmt(listing: dict) -> str:
@@ -125,21 +175,31 @@ def fmt(listing: dict) -> str:
         f"🔗 [Открыть]({listing['url']})"
     )
 
-# ── Проверка ──────────────────────────────────
+# ── Проверка и рассылка ───────────────────────────────────────────────────────
 
 async def check_and_notify(app: Application):
     data = load_data()
-    logger.info(f"⏰ Проверка. Пользователей: {len(data)}")
+    logger.info(f"⏰ Проверка. Активных пользователей: "
+                f"{sum(1 for u in data.values() if u.get('active'))}")
+
     for uid, user in data.items():
         if not user.get("active") or not user.get("max_price"):
             continue
-        chat_id = int(uid)
+
+        chat_id  = int(uid)
         seen_ids = user.get("seen_ids", [])
+
         listings = parse_listings(user["max_price"], user.get("rooms", []))
+
+        # ✅ Фильтруем только те, чей ID ещё не встречался
         new = [l for l in listings if l["id"] not in seen_ids]
+
+        logger.info(f"  Пользователь {uid}: всего={len(listings)}, новых={len(new)}, "
+                    f"уже видели={len(seen_ids)}")
+
         if not new:
-            logger.info(f"Нет новых для {uid}")
             continue
+
         sent = 0
         for l in new[:10]:
             try:
@@ -147,39 +207,45 @@ async def check_and_notify(app: Application):
                     await app.bot.send_photo(chat_id=chat_id, photo=l["photo"],
                                              caption=fmt(l), parse_mode="Markdown")
                 else:
-                    await app.bot.send_message(chat_id=chat_id, text=fmt(l), parse_mode="Markdown")
+                    await app.bot.send_message(chat_id=chat_id, text=fmt(l),
+                                               parse_mode="Markdown")
+                # ✅ Сразу сохраняем ID после отправки — не ждём конца цикла
                 seen_ids.append(l["id"])
+                user["seen_ids"] = seen_ids[-1000:]
+                save_user(chat_id, user)
                 sent += 1
                 await asyncio.sleep(0.5)
             except Exception as e:
                 logger.error(f"Ошибка отправки: {e}")
-        user["seen_ids"] = seen_ids[-500:]
+
         user["notified_count"] = user.get("notified_count", 0) + sent
         save_user(chat_id, user)
+
         if sent:
             await app.bot.send_message(
                 chat_id=chat_id,
-                text=f"✅ Отправлено {sent} новых. Следующая проверка через {CHECK_INTERVAL_MINUTES} мин."
+                text=f"✅ Отправлено {sent} новых объявлений. "
+                     f"Следующая проверка через {CHECK_INTERVAL_MINUTES} мин."
             )
 
 async def scheduled_check(context: ContextTypes.DEFAULT_TYPE):
     await check_and_notify(context.application)
 
-# ── Команды ───────────────────────────────────
+# ── Команды ───────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     get_user(update.effective_chat.id)
     await update.message.reply_text(
-        "👋 *Привет\\! Я слежу за Krisha\\.kz*\n\n"
+        "👋 *Привет! Я слежу за Krisha.kz*\n\n"
         "🏢 Продажа квартир — Алматы\n\n"
         "Команды:\n"
-        "• /setprice `45000000` — макс\\. цена\n"
+        "• /setprice `45000000` — макс. цена в тенге\n"
         "• /rooms — фильтр по комнатам\n"
         "• /start\\_monitor — запустить\n"
         "• /stop\\_monitor — остановить\n"
         "• /status — настройки\n"
         "• /check — проверить сейчас",
-        parse_mode="MarkdownV2",
+        parse_mode="Markdown",
     )
 
 async def cmd_setprice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -192,25 +258,35 @@ async def cmd_setprice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         price = int(ctx.args[0].replace(",", "").replace(" ", ""))
         assert price > 0
     except:
-        await update.message.reply_text("❌ Неверный формат. Пример: `/setprice 45000000`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Пример: `/setprice 45000000`", parse_mode="Markdown")
         return
     user["max_price"] = price
+    # ✅ seen_ids сбрасываем ТОЛЬКО при смене цены — не при старте мониторинга
     user["seen_ids"] = []
     save_user(chat_id, user)
+    p = f"{price:,}".replace(",", " ")
     await update.message.reply_text(
-        f"✅ Макс. цена: *{price:,} ₸*\n\nЗапусти /start\_monitor".replace(",", " "),
+        f"✅ Макс. цена: *{p} ₸*\n\nЗапусти /start\\_monitor",
         parse_mode="Markdown"
     )
 
 async def cmd_rooms(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [
-        [InlineKeyboardButton("1️⃣ Однушки", callback_data="rooms_1"),
-         InlineKeyboardButton("2️⃣ Двушки", callback_data="rooms_2")],
-        [InlineKeyboardButton("3️⃣ Трёшки", callback_data="rooms_3"),
+        [InlineKeyboardButton("1️⃣ Однушки",        callback_data="rooms_1"),
+         InlineKeyboardButton("2️⃣ Двушки",         callback_data="rooms_2")],
+        [InlineKeyboardButton("3️⃣ Трёшки",         callback_data="rooms_3"),
          InlineKeyboardButton("4️⃣+ Многокомнатные", callback_data="rooms_4")],
         [InlineKeyboardButton("🏠 Любое количество", callback_data="rooms_0")],
     ]
-    await update.message.reply_text("🛏 Выбери комнаты:", reply_markup=InlineKeyboardMarkup(kb))
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    cur = user.get("rooms", [])
+    cur_txt = f"Сейчас выбрано: {', '.join(map(str, cur))}-комн." if cur else "Сейчас: любые"
+    await update.message.reply_text(
+        f"🛏 Выбери комнаты:\n_{cur_txt}_",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
 
 async def callback_rooms(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -223,7 +299,10 @@ async def callback_rooms(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         label = "🏠 Любое количество"
     else:
         cur = user.get("rooms", [])
-        cur.remove(num) if num in cur else cur.append(num)
+        if num in cur:
+            cur.remove(num)
+        else:
+            cur.append(num)
         user["rooms"] = sorted(cur)
         label = f"Выбрано: {', '.join(map(str, user['rooms']))}-комн." if user["rooms"] else "Ничего не выбрано"
     save_user(chat_id, user)
@@ -235,18 +314,23 @@ async def cmd_start_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not user.get("max_price"):
         await update.message.reply_text("⚠️ Сначала: `/setprice 45000000`", parse_mode="Markdown")
         return
+
     user["active"] = True
-    user["seen_ids"] = []
+    # ✅ НЕ сбрасываем seen_ids здесь — иначе будут дубли при перезапуске
     save_user(chat_id, user)
+
+    p = f"{user['max_price']:,}".replace(",", " ")
     rooms_txt = f"{', '.join(map(str, user['rooms']))}-комн." if user.get("rooms") else "любые"
-    price_fmt = str(user['max_price'])
+    seen_count = len(user.get("seen_ids", []))
+
     await update.message.reply_text(
-        f"🚀 *Мониторинг запущен\\!*\n\n"
-        f"💰 Макс\\. цена: *{price_fmt} ₸*\n"
+        f"🚀 *Мониторинг запущен!*\n\n"
+        f"💰 Макс. цена: *{p} ₸*\n"
         f"🛏 Комнаты: *{rooms_txt}*\n"
         f"📍 Город: *Алматы*\n"
-        f"⏱ Каждые *{CHECK_INTERVAL_MINUTES} минут*",
-        parse_mode="MarkdownV2",
+        f"⏱ Каждые *{CHECK_INTERVAL_MINUTES} минут*\n"
+        f"📋 Уже видели: *{seen_count}* объявлений",
+        parse_mode="Markdown",
     )
     await update.message.reply_text("🔍 Первая проверка прямо сейчас...")
     await check_and_notify(ctx.application)
@@ -256,12 +340,15 @@ async def cmd_stop_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = get_user(chat_id)
     user["active"] = False
     save_user(chat_id, user)
-    await update.message.reply_text("⏹ Мониторинг остановлен. Возобновить: /start\\_monitor", parse_mode="Markdown")
+    await update.message.reply_text(
+        "⏹ Мониторинг остановлен.\nВозобновить: /start\\_monitor",
+        parse_mode="Markdown"
+    )
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = get_user(chat_id)
-    price = str(user['max_price']) if user.get("max_price") else "не задана"
+    price = f"{user['max_price']:,}".replace(",", " ") if user.get("max_price") else "не задана"
     status = "🟢 Активен" if user.get("active") else "🔴 Остановлен"
     rooms_txt = f"{', '.join(map(str, user['rooms']))}-комн." if user.get("rooms") else "любые"
     await update.message.reply_text(
@@ -269,7 +356,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"• Статус: {status}\n"
         f"• Макс. цена: *{price} ₸*\n"
         f"• Комнаты: *{rooms_txt}*\n"
-        f"• Отправлено: {user.get('notified_count', 0)} объявлений",
+        f"• Уже видели объявлений: {len(user.get('seen_ids', []))}\n"
+        f"• Отправлено уведомлений: {user.get('notified_count', 0)}",
         parse_mode="Markdown"
     )
 
@@ -280,34 +368,45 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Сначала: `/setprice 45000000`", parse_mode="Markdown")
         return
     if not user.get("active"):
-        await update.message.reply_text("⚠️ Запусти мониторинг: /start\\_monitor", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Запусти /start\\_monitor", parse_mode="Markdown")
         return
     await update.message.reply_text("🔍 Проверяю...")
     await check_and_notify(ctx.application)
 
-# ── Запуск ────────────────────────────────────
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Сбросить историю просмотренных (если нужно получить все объявления заново)."""
+    chat_id = update.effective_chat.id
+    user = get_user(chat_id)
+    user["seen_ids"] = []
+    save_user(chat_id, user)
+    await update.message.reply_text("🔄 История просмотренных сброшена. При следующей проверке придут все текущие объявления.")
+
+# ── Запуск ────────────────────────────────────────────────────────────────────
 
 def main():
     if BOT_TOKEN == "ВСТАВЬ_СВОЙ_ТОКЕН_ЗДЕСЬ":
         print("❌ Укажи BOT_TOKEN!")
-        print("   Windows PowerShell: $env:BOT_TOKEN='твой_токен'")
-        print("   Linux/macOS:        export BOT_TOKEN='твой_токен'")
+        print("   Windows: $env:BOT_TOKEN='токен'")
+        print("   Linux:   export BOT_TOKEN='токен'")
         return
 
-    print("🤖 Запуск Krisha.kz Bot...")
+    import sys
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+    print("🤖 Запуск Krisha.kz Bot...")
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("setprice", cmd_setprice))
-    app.add_handler(CommandHandler("rooms", cmd_rooms))
+    app.add_handler(CommandHandler("start",         cmd_start))
+    app.add_handler(CommandHandler("setprice",      cmd_setprice))
+    app.add_handler(CommandHandler("rooms",         cmd_rooms))
     app.add_handler(CommandHandler("start_monitor", cmd_start_monitor))
-    app.add_handler(CommandHandler("stop_monitor", cmd_stop_monitor))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CommandHandler("stop_monitor",  cmd_stop_monitor))
+    app.add_handler(CommandHandler("status",        cmd_status))
+    app.add_handler(CommandHandler("check",         cmd_check))
+    app.add_handler(CommandHandler("reset",         cmd_reset))
     app.add_handler(CallbackQueryHandler(callback_rooms, pattern="^rooms_"))
 
-    # ✅ Встроенный JobQueue — никакого APScheduler
     app.job_queue.run_repeating(
         scheduled_check,
         interval=CHECK_INTERVAL_MINUTES * 60,
